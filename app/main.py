@@ -240,6 +240,31 @@ class PunchInIn(BaseModel):
     status: PresenceStatus = "PRESENT"
 
 
+class PunchOutIn(BaseModel):
+    emp_code: str
+    punched_at: Optional[EpochMillis] = None
+
+
+class RegularizeIn(BaseModel):
+    """Derived fields a client might send are simply ignored (extra fields are dropped)."""
+
+    status: Optional[Status] = None
+    punch_in: Optional[EpochMillis] = None
+    punch_out: Optional[EpochMillis] = None
+    reason: Annotated[str, Field(min_length=5, max_length=200)]
+    regularized_by: Annotated[str, Field(min_length=1, max_length=50)]
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_explicit_nulls(cls, data):
+        # "omitted" means unchanged; an explicit null is not a valid value for any of these
+        if isinstance(data, dict):
+            for field in ("status", "punch_in", "punch_out"):
+                if field in data and data[field] is None:
+                    raise ValueError(f"{field} may be omitted but not null")
+        return data
+
+
 # --------------------------------------------------------------------------- #
 # 4. Serialization
 # --------------------------------------------------------------------------- #
@@ -378,3 +403,96 @@ def list_attendance(
     total = logs.count_documents(q) if q else logs.estimated_document_count()
     cursor = logs.find(q, {"_id": 0}).sort(ATTENDANCE_SORT).skip((page - 1) * page_size).limit(page_size)
     return {"items": [record_out(d) for d in cursor], "total": total, "page": page, "page_size": page_size}
+
+
+MAX_SHIFT = timedelta(hours=24)
+
+
+@app.post("/attendance/punch-out")
+def punch_out(body: PunchOutIn):
+    emp = get_employee(body.emp_code)
+    ts = from_ms(body.punched_at) if body.punched_at is not None else now_utc()
+    # most recent punch-in at or before this instant; works across midnight for overnight shifts
+    rec = logs.find_one({"emp_code": body.emp_code, "punch_in": {"$lte": ts}}, sort=[("punch_in", DESCENDING)])
+    if rec is None:
+        raise HTTPException(404, f"no punch-in found for {body.emp_code}")
+    if rec.get("punch_out") is not None:
+        raise HTTPException(409, f"record for {rec['date']} is already punched out")
+    if ts <= rec["punch_in"]:
+        raise unprocessable("punched_at must be after punch_in", ["body", "punched_at"])
+    if ts - rec["punch_in"] > MAX_SHIFT:
+        raise unprocessable("punched_at is more than 24 hours after punch_in", ["body", "punched_at"])
+
+    day = date.fromisoformat(rec["date"])
+    update = {"punch_out": ts, **derived_fields(rec["status"], rec["punch_in"], ts, emp, day)}
+    # the punch_out: null condition makes this the single winner among simultaneous punch-outs
+    updated = logs.find_one_and_update(
+        {"_id": rec["_id"], "punch_out": None},
+        {"$set": update},
+        projection={"_id": 0},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(409, f"record for {rec['date']} is already punched out")
+    return record_out(updated)
+
+
+@app.patch("/attendance/{emp_code}/{date}")
+def regularize(emp_code: str, date: DateStr, body: RegularizeIn):
+    emp = get_employee(emp_code)
+    rec = logs.find_one({"emp_code": emp_code, "date": date})
+    if rec is None:
+        raise HTTPException(404, f"no attendance record for {emp_code} on {date}")
+    day = datetime.strptime(date, "%Y-%m-%d").date()
+
+    status = body.status or rec["status"]
+    if status in NON_PRESENCE:
+        if body.punch_in is not None or body.punch_out is not None:
+            raise unprocessable(f"{status} clears the punch times; do not send punch_in/punch_out", ["body"])
+        new_in = new_out = None
+    else:
+        new_in = from_ms(body.punch_in) if body.punch_in is not None else rec.get("punch_in")
+        new_out = from_ms(body.punch_out) if body.punch_out is not None else rec.get("punch_out")
+        if new_in is None:
+            raise unprocessable(f"status {status} needs a punch_in", ["body", "punch_in"])
+        if body.punch_in is not None and attendance_date(new_in, emp) != day:
+            raise unprocessable(f"punch_in must stay on attendance date {date}", ["body", "punch_in"])
+        if new_out is not None and not (new_in < new_out <= new_in + MAX_SHIFT):
+            raise unprocessable("punch_out must be after punch_in and within 24 hours", ["body", "punch_out"])
+
+    before = {
+        "status": rec["status"],
+        "punch_in": rec.get("punch_in"),
+        "punch_out": rec.get("punch_out"),
+        "work_hours": rec.get("work_hours"),
+        "late_minutes": rec.get("late_minutes") or 0,
+        "overtime_minutes": rec.get("overtime_minutes") or 0,
+        "half_day": rec.get("half_day") or False,
+    }
+    after = {"status": status, "punch_in": new_in, "punch_out": new_out, **derived_fields(status, new_in, new_out, emp, day)}
+    changes = {k: {"from": before[k], "to": after[k]} for k in after if before[k] != after[k]}
+    if not changes:
+        raise unprocessable("the request does not change anything", ["body"])
+
+    entry = {"at": now_utc(), "by": body.regularized_by, "reason": body.reason, "changes": changes}
+    # Optimistic concurrency: only apply if nobody changed the record since we read it, i.e. the
+    # editable fields are as read and history still has exactly the length we saw.
+    n = len(rec.get("history") or [])
+    guard = {
+        "_id": rec["_id"],
+        "status": rec["status"],
+        "punch_in": rec.get("punch_in"),
+        "punch_out": rec.get("punch_out"),
+        f"history.{n}": {"$exists": False},
+    }
+    if n:
+        guard[f"history.{n - 1}"] = {"$exists": True}
+    updated = logs.find_one_and_update(
+        guard,
+        {"$set": after, "$push": {"history": entry}},
+        projection={"_id": 0},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        raise HTTPException(409, "the record was changed by another request; reload and retry")
+    return record_out(updated)
