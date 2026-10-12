@@ -11,6 +11,8 @@ import time as clock
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from pymongo.errors import BulkWriteError, PyMongoError
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app import main  # noqa: E402
 
@@ -63,10 +65,27 @@ def make_record(emp, day):
     return doc
 
 
+def insert(batch):
+    """insert_many that survives flaky connections; a retried batch may hit rows that already
+    made it, which the unique (emp_code, date) index rejects and we ignore."""
+    for attempt in range(8):
+        try:
+            main.logs.insert_many(batch, ordered=False)
+            return
+        except BulkWriteError as exc:
+            if all(e["code"] == 11000 for e in exc.details["writeErrors"]):
+                return
+            raise
+        except PyMongoError:
+            clock.sleep(2 * (attempt + 1))
+    raise RuntimeError("giving up on a batch after 8 attempts")
+
+
 def main_():
     emps = make_employees()
     main.employees.drop()
     main.logs.drop()
+    main.ensure_indexes()  # before loading, so a retried batch cannot duplicate rows
     main.employees.insert_many([dict(e) for e in emps])
     no_logs = set(random.sample([e["emp_code"] for e in emps], 15))
     batch, total, t0 = [], 0, clock.time()
@@ -79,12 +98,12 @@ def main_():
             if (not weekend and random.random() < 0.95) or (weekend and random.random() < 0.04):
                 batch.append(make_record(emp, day))
             day += timedelta(days=1)
-            if len(batch) >= 5000:
-                main.logs.insert_many(batch, ordered=False)
+            if len(batch) >= 2000:
+                insert(batch)
                 total += len(batch)
                 batch = []
     if batch:
-        main.logs.insert_many(batch, ordered=False)
+        insert(batch)
         total += len(batch)
     main.ensure_indexes()
     print(f"{len(emps)} employees, {total} attendance records in {clock.time() - t0:.0f}s -> db '{main.db.name}'")

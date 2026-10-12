@@ -150,9 +150,14 @@ def test_punch_out_overtime_threshold_and_half_day(api):
     assert r["overtime_minutes"] == 0  # 29:59 after shift end
     make_emp(api, "EMP0002")
     api.post("/attendance/punch-in", json={"emp_code": "EMP0002", "punched_at": ms("2026-07-06T09:30:00")})
-    # 4h29m42s = 4.495h -> 4.50 half-up (float round gives 4.49): not a half day
+    # 4h29m42s = 4.495h -> 4.50 half-up: not a half day
     r = api.post("/attendance/punch-out", json={"emp_code": "EMP0002", "punched_at": ms("2026-07-06T13:59:42")}).json()
     assert (r["work_hours"], r["half_day"]) == (4.5, False)
+    make_emp(api, "EMP0003")
+    api.post("/attendance/punch-in", json={"emp_code": "EMP0003", "punched_at": ms("2026-07-06T09:30:00")})
+    # 2h01m30s = 2.025h -> 2.03 half-up (float round() gives 2.02)
+    r = api.post("/attendance/punch-out", json={"emp_code": "EMP0003", "punched_at": ms("2026-07-06T11:31:30")}).json()
+    assert (r["work_hours"], r["half_day"]) == (2.03, True)
 
 
 def test_overnight_shift(api):
