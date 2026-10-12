@@ -16,7 +16,7 @@ uvicorn app.main:app --port 8000
 ## Tests
 
 ```bash
-pip install pytest httpx
+pip install -r requirements-dev.txt
 pytest -q                                   # needs MONGO_URI; uses and wipes MONGO_DB_TEST (default attendance_test)
 python scripts/generate_data.py             # ~100k realistic records into MONGO_DB, for explain/timing checks
 ```

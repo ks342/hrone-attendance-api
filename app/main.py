@@ -319,10 +319,13 @@ def record_out(doc: dict) -> dict:
 def health():
     try:
         client.admin.command("ping")
-        if not _indexes_ready:
-            ensure_indexes()
     except PyMongoError:
         raise HTTPException(503, "database unavailable")
+    if not _indexes_ready:  # MongoDB was down at startup; readiness only depends on the ping
+        try:
+            ensure_indexes()
+        except PyMongoError as exc:
+            log.error("could not create indexes: %s", exc)
     return {"status": "ok"}
 
 
