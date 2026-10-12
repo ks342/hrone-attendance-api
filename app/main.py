@@ -11,6 +11,7 @@ Layout of this file:
   4. serialization (MongoDB document -> API shape)
   5. endpoints: system, employees, attendance
 """
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -18,6 +19,7 @@ from datetime import date, datetime, time, timedelta, timezone
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Annotated, Any, Literal, Optional
 
+from bson import json_util
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import AfterValidator, BaseModel, Field, model_validator
@@ -769,3 +771,61 @@ def department_trend(
         raise HTTPException(404, f"department {department} not found")
     collection, pipeline = build_department_trend(department, first, last)
     return {"department": department, "items": list(collection.aggregate(pipeline))}
+
+
+# --------------------------------------------------------------------------- #
+# 7. Admin: explain
+# --------------------------------------------------------------------------- #
+ExplainTarget = Literal["attendance_list", "employee_monthly", "department_summary", "late_leaderboard", "department_trend"]
+
+
+def _require(**params) -> None:
+    missing = [name for name, value in params.items() if value is None]
+    if missing:
+        raise HTTPException(422, [{"type": "missing", "loc": ["query", m], "msg": "Field required"} for m in missing])
+
+
+@app.get("/admin/explain/{endpoint}")
+def explain(
+    endpoint: ExplainTarget,
+    emp_code: Optional[str] = None,
+    month: Annotated[Optional[MonthStr], Query()] = None,
+    department: Optional[str] = None,
+    limit: Limit = 10,
+    date_from: Annotated[Optional[DateStr], Query()] = None,
+    date_to: Annotated[Optional[DateStr], Query()] = None,
+    status: Optional[Status] = None,
+    start: Annotated[Optional[DateStr], Query(alias="from")] = None,
+    end: Annotated[Optional[DateStr], Query(alias="to")] = None,
+    page: Page = 1,
+    page_size: PageSize = 20,
+):
+    """Explain the main query of an endpoint, built by the same code the endpoint uses."""
+    if endpoint == "attendance_list":
+        q = attendance_query(emp_code, date_from, date_to, status)
+        collection = logs
+        command = {
+            "find": logs.name,
+            "filter": q,
+            "projection": {"_id": 0},
+            "sort": dict(ATTENDANCE_SORT),
+            "skip": (page - 1) * page_size,
+            "limit": page_size,
+        }
+    else:
+        if endpoint == "employee_monthly":
+            _require(emp_code=emp_code, month=month)
+            collection, pipeline = build_employee_monthly(emp_code, month)
+        elif endpoint == "department_summary":
+            _require(month=month)
+            collection, pipeline = build_department_summary(month, department)
+        elif endpoint == "late_leaderboard":
+            _require(month=month)
+            collection, pipeline = build_late_leaderboard(month, limit, department)
+        else:
+            _require(department=department, **{"from": start, "to": end})
+            collection, pipeline = build_department_trend(department, *trend_range(start, end))
+        command = {"aggregate": collection.name, "pipeline": pipeline, "cursor": {}}
+
+    result = db.command({"explain": command, "verbosity": "executionStats"})
+    return {"endpoint": endpoint, "collection": collection.name, "explain": json.loads(json_util.dumps(result))}
