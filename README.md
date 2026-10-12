@@ -1,4 +1,5 @@
 # Employee Attendance & Analytics API
+n[![tests](https://github.com/ks342/hrone-attendance-api/actions/workflows/tests.yml/badge.svg)](https://github.com/ks342/hrone-attendance-api/actions/workflows/tests.yml)
 
 FastAPI + MongoDB backend for the HROne assignment: punch-in/out, regularization with an audit trail, and four analytics endpoints built as aggregation pipelines. Everything the app runs is in [`app/main.py`](app/main.py).
 
